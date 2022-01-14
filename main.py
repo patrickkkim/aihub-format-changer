@@ -2,11 +2,12 @@ from PIL import Image
 from random import sample
 
 import xml.etree.cElementTree as ET
+import multiprocessing
+import ray, psutil
 import shutil
 import glob
 import json
 import os
-
 
 
 class ProgressLoader:
@@ -17,20 +18,42 @@ class ProgressLoader:
         self.subLength = 1
         self.blockCount = 50
 
-        self.printProgress()
+        self.printWhole("Waiting for process")
 
-    def printProgress(self):
+    def printIncrement(self, i, subtext="", speed=7):
+        if i % int(self.subLength / speed) == 0:
+            self.printWhole(subtext)
+
+    def printWhole(self, subtext=""):
         self.clear()
-        progress = (self.progress / self.length * 100.0) * (self.blockCount / 10.0)
-        subProgress = (self.subProgress / self.subLength * 100.0) * (self.blockCount / 10.0)
-        count = int(progress / 10.0)
-        subCount = int(subProgress / 10.0)
+        self.printProgress(self.progress, self.length, "Total: ")
+        self.printProgress(self.subProgress, self.subLength, subtext)
+
+    def printProgress(self, progress, length, text=""):
+        progressPercentage = (progress / length * 100.0)
+        count = int(progressPercentage / 100.0 * self.blockCount)
+        
         progressBar = "█" * count + "░" * (self.blockCount - count)
-        subProgressBar = "█" * subCount + "░" * (self.blockCount - subCount)
         print(progressBar)
-        print()
-        print(subProgressBar)
-        print("Processing {:.1f}%...".format(subProgress / (self.blockCount / 10.0)))
+        text = str(text)
+        print(text + " {:.1f}%...".format(progressPercentage))
+        print("\n")
+
+    def updateLength(self, length, increment=False):
+        if increment: self.length += 1
+        else: self.length = length
+
+    def updateSubLength(self, length, increment=False):
+        if increment: self.subLength += 1
+        else: self.subLength = length
+
+    def updateProgress(self, amount=1):
+        self.progress += amount
+
+    def updateSubProgress(self, amount=1, reset=False):
+        if reset: self.subProgress = 0
+        else:
+            self.subProgress += amount
 
     def clear(self):
         os.system("cls")
@@ -45,6 +68,9 @@ class DataFormat:
         self.inputPath = "./xml/"
         self.directoryList, _ = self.getDirList(self.inputPath)
 
+        num_cpus = psutil.cpu_count(logical=False)
+        ray.init(num_cpus=num_cpus, log_to_driver=True)
+
     def getDirList(self, searchDir):
         for base, dirs, files in os.walk(searchDir):
             directoryList = []
@@ -55,22 +81,21 @@ class DataFormat:
                 fileList.append(file)
             return directoryList, fileList
 
-    def resizeImages(self, inputDir, outputDir):
-        progressSpeed = 7
+    @ray.remote
+    def resizeImages(self, width, inputDir, outputDir):
         _, fileList = self.getDirList(inputDir)
-        subLength = len(fileList)
-        self.pLoader.subLength = subLength
-        self.pLoader.subProgress = 0
+        
+        # self.pLoader.updateSubLength(len(fileList))
+        # self.pLoader.updateSubProgress(reset=True)
         for i, fileName in enumerate(fileList[1:]):
-            self.resizeImage(inputDir, outputDir, fileName)
-            self.pLoader.subProgress += 1
-            if i % int(subLength / progressSpeed) == 0:
-                self.pLoader.printProgress()
-        self.pLoader.progress += 1
+            self.resizeImage(width, inputDir, outputDir, fileName)
+        #     self.pLoader.updateSubProgress()
+        #     self.pLoader.printIncrement(i, 4)
+        # self.pLoader.updateProgress()
 
-    def resizeImage(self, inputDir, outputDir, imgName):
+    def resizeImage(self, width, inputDir, outputDir, imgName):
         image = Image.open(inputDir + "/" + imgName)
-        newImage = image.resize((640, 640), Image.NEAREST)
+        newImage = image.resize((width, width), Image.NEAREST)
         newImage.save(outputDir + "/" + imgName)
 
     def getRoot(self, dirName):
@@ -82,7 +107,9 @@ class DataFormat:
     def getCategories(self, root):
         categoryList = []
         categoryDict = {}
-        for i, label in enumerate(root[1][0][12].findall('label')):
+
+        labels = root[1][0][12].findall('label')
+        for i, label in enumerate(labels):
             category = {"supercategory": "none", "id": i+1, "name": label[0].text}
             categoryList.append(category)
             categoryDict[label[0].text] = i+1
@@ -91,13 +118,14 @@ class DataFormat:
 
 
 class YoloFormat(DataFormat):
-    def __init__(self, resize, valid=20, test=10):
+    def __init__(self, resize, valid=20, test=5):
         super().__init__(resize)
         self.categoryDict = {}
         self.valid = valid
         self.test = test
         self.outputPath = "./yolo/"
 
+        self.pLoader.updateLength(len(self.directoryList) + 1)
         self.createYolo()
         self.createYaml()
         self.resizeImages()
@@ -111,7 +139,6 @@ class YoloFormat(DataFormat):
             os.mkdir(outputDir + "/images")
             os.mkdir(outputDir + "/labels")
 
-        self.pLoader.length = len(self.directoryList)
         for dirName in self.directoryList:
             root = self.getRoot(dirName)
             _, subDict = self.getCategories(root)
@@ -120,11 +147,17 @@ class YoloFormat(DataFormat):
         for i, pair in enumerate(self.categoryDict.items()):
             self.categoryDict[pair[0]] = i
 
-        for dirName in self.directoryList:
+        progressText = "Creating Labels"
+        self.pLoader.updateSubProgress(reset=True)
+        self.pLoader.updateSubLength(len(self.directoryList))
+        for i, dirName in enumerate(self.directoryList):
             root = self.getRoot(dirName)
             self.createLabels(root)
+            self.pLoader.updateSubProgress()
+            self.pLoader.printIncrement(i, progressText, 4)
 
-        self.pLoader.printProgress()
+        self.pLoader.updateProgress()
+        self.pLoader.printWhole("Done")
 
     def shuffleData(self, dir):
         fileList = []
@@ -163,11 +196,17 @@ class YoloFormat(DataFormat):
             f.close()
 
     def resizeImages(self):
+        refs = []
         for dirName in self.directoryList:
-            super().resizeImages(self.inputPath + dirName, self.outputPath + "train/images")
+            refs.append(super().resizeImages.remote(
+                    self, self.resize, self.inputPath + dirName, self.outputPath + "train/images"
+                )
+            )
+        ray.get(refs)
 
     def createLabels(self, root):
-        for imageTag in root.findall("image"):
+        imageTags = root.findall("image")
+        for i, imageTag in enumerate(imageTags):
             name = imageTag.attrib['name'][:-4]
             height = float(imageTag.attrib['height'])
             width = float(imageTag.attrib['width'])
@@ -200,7 +239,7 @@ class CocoFormat(DataFormat):
         self.ouputPath = "./coco/"
 
     def createCoco(self):
-        self.pLoader.length = len(self.directoryList)
+        self.pLoader.updateLength(len(self.directoryList))
         for dirName in self.directoryList:
             root = self.getRoot(dirName)
             info = self.getInfo(root)
@@ -227,7 +266,7 @@ class CocoFormat(DataFormat):
 
             self.resizeImages(inputDir, outputDir)
 
-        self.pLoader.printProgress()
+        self.pLoader.printWhole()
 
     def getInfo(self, root):
         task = root[1][0]
@@ -314,4 +353,4 @@ class CocoFormat(DataFormat):
 
 
 if __name__ == '__main__':
-    yolo = YoloFormat(640.0)
+    yolo = YoloFormat(1280)
