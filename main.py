@@ -1,4 +1,5 @@
 from PIL import Image
+from tqdm import tqdm
 from random import sample
 
 import xml.etree.cElementTree as ET
@@ -7,58 +8,47 @@ import ray, psutil
 import shutil
 import glob
 import json
-import os
+import os, sys
+
+from ProgressBar import ProgressBar
+
 
 
 class ProgressLoader:
     def __init__(self):
         self.progress = 0
         self.length = 1
-        self.subProgress = 0
-        self.subLength = 1
-        self.blockCount = 50
+        self.blockCount = 30
 
-        self.printWhole("Waiting for process")
+        self.clear()
+        self.printWhole("Waiting for process. Please wait a moment.")
 
     def printIncrement(self, i, subtext="", speed=7):
-        if i % int(self.subLength / speed) == 0:
+        if i % int(self.length / speed) == 0:
             self.printWhole(subtext)
 
     def printWhole(self, subtext=""):
-        self.clear()
-        self.printProgress(self.progress, self.length, "Total: ")
-        self.printProgress(self.subProgress, self.subLength, subtext)
+        self.printProgress(self.progress, self.length, subtext)
 
     def printProgress(self, progress, length, text=""):
         progressPercentage = (progress / length * 100.0)
         count = int(progressPercentage / 100.0 * self.blockCount)
         
         progressBar = "█" * count + "░" * (self.blockCount - count)
-        print(progressBar)
         text = str(text)
-        print(text + " {:.1f}%...".format(progressPercentage))
-        print("\n")
+        print(" [- " + progressBar + " {:.1f}% -]".format(progressPercentage) + " " + text, end='\r')
 
     def updateLength(self, length, increment=False):
         if increment: self.length += 1
         else: self.length = length
 
-    def updateSubLength(self, length, increment=False):
-        if increment: self.subLength += 1
-        else: self.subLength = length
-
-    def updateProgress(self, amount=1):
-        self.progress += amount
-
-    def updateSubProgress(self, amount=1, reset=False):
-        if reset: self.subProgress = 0
+    def updateProgress(self, amount=1, reset=False):
+        if reset: self.progress = 0
         else:
-            self.subProgress += amount
+            self.progress += amount
 
     def clear(self):
-        os.system("cls")
-        os.system("clear")
-
+        os.system('cls')
 
 
 class DataFormat:
@@ -84,14 +74,8 @@ class DataFormat:
     @ray.remote
     def resizeImages(self, width, inputDir, outputDir):
         _, fileList = self.getDirList(inputDir)
-        
-        # self.pLoader.updateSubLength(len(fileList))
-        # self.pLoader.updateSubProgress(reset=True)
         for i, fileName in enumerate(fileList[1:]):
             self.resizeImage(width, inputDir, outputDir, fileName)
-        #     self.pLoader.updateSubProgress()
-        #     self.pLoader.printIncrement(i, 4)
-        # self.pLoader.updateProgress()
 
     def resizeImage(self, width, inputDir, outputDir, imgName):
         image = Image.open(inputDir + "/" + imgName)
@@ -115,6 +99,21 @@ class DataFormat:
             categoryDict[label[0].text] = i+1
         return (categoryList, categoryDict)
 
+    def toIterator(self, objIds):
+        while objIds:
+            done, objIds = ray.wait(objIds)
+            yield ray.get(done[0])
+
+    def executeRay(self, tasks=[], subtext=""):
+        self.pLoader.clear()
+        self.pLoader.updateLength(len(tasks))
+        self.pLoader.updateProgress(reset=True)
+        self.pLoader.printWhole(subtext)
+        for i, _ in enumerate(self.toIterator(tasks)):
+            self.pLoader.updateProgress()
+            self.pLoader.printWhole(subtext)
+        self.pLoader.printWhole(subtext)
+
 
 
 class YoloFormat(DataFormat):
@@ -124,14 +123,30 @@ class YoloFormat(DataFormat):
         self.valid = valid
         self.test = test
         self.outputPath = "./yolo/"
-
-        self.pLoader.updateLength(len(self.directoryList) + 1)
-        self.createYolo()
-        self.createYaml()
-        self.resizeImages()
-        self.shuffleData(self.outputPath + "train/images")
+        self.trainImgPath = ""
+        self.trainLabelPath = ""
+        self.validImgPath = ""
+        self.validLabelPath = ""
+        self.testImgPath = ""
+        self.testLabelPath = ""
+        self.createYolo()        
 
     def createYolo(self):
+        self.initDir()
+        self.initCategory()
+        self.createLabels()
+        self.createYaml()
+        self.resizeImages()
+        self.shuffleData(self.outputPath + self.trainImgPath)
+
+    def initDir(self):
+        self.trainImgPath = "train/images/"
+        self.trainLabelPath = "train/labels/"
+        self.validImgPath = "valid/images/"
+        self.validLabelPath = "valid/labels/"
+        self.testImgPath = "test/images/"
+        self.testLabelPath = "test/labels/"
+
         outputList = ["train", "valid", "test"]
         for dirName in outputList:
             outputDir = self.outputPath + dirName
@@ -139,6 +154,7 @@ class YoloFormat(DataFormat):
             os.mkdir(outputDir + "/images")
             os.mkdir(outputDir + "/labels")
 
+    def initCategory(self):
         for dirName in self.directoryList:
             root = self.getRoot(dirName)
             _, subDict = self.getCategories(root)
@@ -146,23 +162,18 @@ class YoloFormat(DataFormat):
                 self.categoryDict[key] = None
         for i, pair in enumerate(self.categoryDict.items()):
             self.categoryDict[pair[0]] = i
-
-        progressText = "Creating Labels"
-        self.pLoader.updateSubProgress(reset=True)
-        self.pLoader.updateSubLength(len(self.directoryList))
-        for i, dirName in enumerate(self.directoryList):
+        
+    def createLabels(self):
+        tasksPreLaunch = []
+        for dirName in self.directoryList:
             root = self.getRoot(dirName)
-            self.createLabels(root)
-            self.pLoader.updateSubProgress()
-            self.pLoader.printIncrement(i, progressText, 4)
+            tasksPreLaunch.append(self.createLabel.remote(self, root))
+        self.executeRay(tasksPreLaunch, "Creating Labels")
 
-        self.pLoader.updateProgress()
-        self.pLoader.printWhole("Done")
-
-    def shuffleData(self, dir):
+    def shuffleData(self, source):
         fileList = []
         count = 0
-        for base, dirs, files in os.walk(dir):
+        for base, dirs, files in os.walk(source):
             for file in files:
                 count += 1
                 fileList.append(file)
@@ -172,101 +183,185 @@ class YoloFormat(DataFormat):
         sampleList = sample(fileList, validCount+testCount)
         validList = sampleList[:validCount]
         testList = sampleList[validCount:]
-        source = self.outputPath + "train/"
 
-        dest = self.outputPath + "valid/"
-        for imgName in validList:
-            shutil.move(source+"images/"+imgName, dest+"images")
+        progressText = "Shuffling valid, test data"
+
+        self.pLoader.updateLength(len(validList) + len(testList))
+        self.pLoader.updateProgress(reset=True)
+        for i, imgName in enumerate(validList):
+            shutil.move(self.outputPath+self.trainImgPath+imgName, self.outputPath+self.validImgPath)
             labelName = imgName[:-4] + ".txt"
-            shutil.move(source+"labels/"+labelName, dest+"labels")
+            shutil.move(self.outputPath+self.trainLabelPath+labelName, self.outputPath+self.validLabelPath)
+            self.pLoader.updateProgress()
+            self.pLoader.printWhole(progressText)
 
         dest = self.outputPath + "test/"
-        for imgName in testList:
-            shutil.move(source+"images/"+imgName, dest+"images")
+        self.pLoader.updateLength(len(testList))
+        self.pLoader.updateProgress(reset=True)
+        for i ,imgName in enumerate(testList):
+            shutil.move(self.outputPath+self.trainImgPath+imgName, self.outputPath+self.testImgPath)
             labelName = imgName[:-4] + ".txt"
-            shutil.move(source+"labels/"+labelName, dest+"labels")
+            shutil.move(self.outputPath+self.trainLabelPath+labelName, self.outputPath+self.testLabelPath)
+            self.pLoader.updateProgress()
+            self.pLoader.printWhole(progressText)
 
     def createYaml(self):
         with open(self.outputPath + "data.yaml", "w", encoding="utf-8") as f:
-            f.write("train: ../train/images" + "\n")
-            f.write("val: ../valid/images" + "\n")
-            f.write("test: ../test/images" + "\n\n")
+            f.write("train: ../" + self.trainImgPath + "\n")
+            f.write("val: ../" + self.validImgPath + "\n")
+            f.write("test: ../" + self.testImgPath + "\n\n")
             f.write("nc: " + str(len(self.categoryDict)) + "\n")
             f.write("names: " + "['" + "','".join(self.categoryDict.keys()) + "']")
             f.close()
 
     def resizeImages(self):
-        refs = []
+        tasksPreLaunch = []
+        resize = ray.put(self.resize)
+        outputPath = ray.put(self.outputPath + self.trainImgPath)
         for dirName in self.directoryList:
-            refs.append(super().resizeImages.remote(
-                    self, self.resize, self.inputPath + dirName, self.outputPath + "train/images"
+            tasksPreLaunch.append(super().resizeImages.remote(
+                    self, resize, self.inputPath + dirName, outputPath
                 )
             )
-        ray.get(refs)
+        self.executeRay(tasksPreLaunch, "Resizing Images")
 
-    def createLabels(self, root):
+    @ray.remote
+    def createLabel(self, root):
         imageTags = root.findall("image")
-        for i, imageTag in enumerate(imageTags):
+        for imageTag in imageTags:
             name = imageTag.attrib['name'][:-4]
             height = float(imageTag.attrib['height'])
             width = float(imageTag.attrib['width'])
 
             widthDiv, heightDiv = width/self.resize, height/self.resize
-            outputDir = self.outputPath + "train/labels/"
-            with open(outputDir + name + ".txt", "w") as f:
-                for boxTag in imageTag.findall("box"):
-                    attr = boxTag.attrib
-                    label = attr["label"]
-                    xtl, ytl, xbr, ybr = float(attr['xtl']), float(attr['ytl']), \
-                        float(attr['xbr']), float(attr['ybr'])
-                    xtl, ytl, xbr, ybr = xtl/widthDiv, ytl/heightDiv, xbr/widthDiv, ybr/heightDiv
+            with open(self.outputPath + self.trainLabelPath + name + ".txt", "w") as f:
+                self.computeShapes(f, imageTag, widthDiv, heightDiv)
 
-                    category = self.categoryDict[label]
-                    xCenter = ((xtl+xbr) / 2.0) / self.resize
-                    yCenter = ((ytl+ybr) / 2.0) / self.resize
-                    boxWidth = abs(xtl-xbr) / self.resize
-                    boxHeight = abs(ytl-ybr) / self.resize
+    def computeShapes(self, f, imageTag, widthDiv, heightDiv):
+        for boxTag in imageTag.findall("box"):
+            attr = boxTag.attrib
+            label = attr["label"]
+            xtl, ytl, xbr, ybr = float(attr['xtl']), float(attr['ytl']), \
+                float(attr['xbr']), float(attr['ybr'])
+            xtl, ytl, xbr, ybr = xtl/widthDiv, ytl/heightDiv, xbr/widthDiv, ybr/heightDiv
 
-                    outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
-                    f.write(outputLine + "\n")
+            category = self.categoryDict[label]
+            xCenter = ((xtl+xbr) / 2.0) / self.resize
+            yCenter = ((ytl+ybr) / 2.0) / self.resize
+            boxWidth = abs(xtl-xbr) / self.resize
+            boxHeight = abs(ytl-ybr) / self.resize
+
+            outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
+            f.write(outputLine + "\n")
+
+
+
+class YoloPolyFormat(YoloFormat):
+    def __init__(self, resize, valid=20, test=5):
+        super().__init__(resize, valid, test)
+        self.createImgPathFile()
+
+    def computeShapes(self, f, imageTag, widthDiv, heightDiv):
+        for polygonTag in imageTag.findall("polygon"):
+            attr = polygonTag.attrib
+            label = attr["label"]
+            points = attr["points"].split(";")
+
+            category = self.categoryDict[label]
+            outputLine = str(category)
+            for point in points:
+                x, y = point.split(",")
+                outputLine += " " + x + " " + y
+
+            # xtl, ytl, xbr, ybr = float(attr['xtl']), float(attr['ytl']), \
+            #     float(attr['xbr']), float(attr['ybr'])
+            # xtl, ytl, xbr, ybr = xtl/widthDiv, ytl/heightDiv, xbr/widthDiv, ybr/heightDiv
+
+            # xCenter = ((xtl+xbr) / 2.0) / self.resize
+            # yCenter = ((ytl+ybr) / 2.0) / self.resize
+            # boxWidth = abs(xtl-xbr) / self.resize
+            # boxHeight = abs(ytl-ybr) / self.resize
+
+            # outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
+            f.write(outputLine + "\n")
+
+    def initDir(self):
+        self.trainImgPath = "images/train/"
+        self.trainLabelPath = "labels/train/"
+        self.validImgPath = "images/valid/"
+        self.validLabelPath = "labels/valid/"
+        self.testImgPath = "images/test/"
+        self.testLabelPath = "labels/test/"
+
+        outputList = ["images", "labels"]
+        for dirName in outputList:
+            outputDir = self.outputPath + dirName
+            os.mkdir(outputDir)
+            os.mkdir(outputDir + "/train")
+            os.mkdir(outputDir + "/valid")
+            os.mkdir(outputDir + "/test")
+
+    def createYaml(self):
+        with open(self.outputPath + "data.yaml", "w", encoding="utf-8") as f:
+            f.write("train: ../" + "train.txt" + "\n")
+            f.write("val: ../" + "valid.txt" + "\n")
+            f.write("test: ../" + "test.txt" + "\n\n")
+            f.write("nc: " + str(len(self.categoryDict)) + "\n")
+            f.write("names: " + "['" + "','".join(self.categoryDict.keys()) + "']")
+            f.close()
+
+    def createImgPathFile(self):
+        sourceDict = {"train":self.trainImgPath, "valid":self.validImgPath, "test":self.testImgPath}
+
+        for key, value in sourceDict.items():
+            for base, dirs, files in os.walk(self.outputPath + value):
+                with open(self.outputPath + key + ".txt", "w") as f:
+                    for file in files:
+                        f.write("../" + value + file + "\n")
 
 
 
 class CocoFormat(DataFormat):
     def __init__(self, resize):
         super().__init__(resize)
-
         self.ouputPath = "./coco/"
 
+        self.createCoco()
+
     def createCoco(self):
-        self.pLoader.updateLength(len(self.directoryList))
+        jsonTasks = []
+        resizeTasks = []
+        resize = ray.put(self.resize)
         for dirName in self.directoryList:
-            root = self.getRoot(dirName)
-            info = self.getInfo(root)
-            licenses = self.getLicenses()
-            categories, categoryDict = self.getCategories(root)
-            images = self.getImages(root)
-            annotations = self.getAnnotations(root, categoryDict)
-
-            coco = {
-                "info": info,
-                "licenses": licenses,
-                "images": images,
-                "annotations": annotations,
-                "categories": categories,
-                "segment_info": []
-            }
-
             inputDir = self.inputPath + dirName
             outputDir = self.ouputPath + dirName
 
-            os.mkdir(outputDir)
-            with open(outputDir + "/" + dirName + ".json", "w", encoding="utf-8") as f:
-                json.dump(coco, f, ensure_ascii=False, indent=4)
+            jsonTasks.append(self.createJson.remote(self, dirName, outputDir))
+            resizeTasks.append(self.resizeImages.remote(self, resize, inputDir, outputDir))
+        self.executeRay(jsonTasks, "Creating JSON files")
+        self.executeRay(resizeTasks, "Resizing Images")
 
-            self.resizeImages(inputDir, outputDir)
+    @ray.remote
+    def createJson(self, dirName, outputDir):
+        root = self.getRoot(dirName)
+        info = self.getInfo(root)
+        licenses = self.getLicenses()
+        categories, categoryDict = self.getCategories(root)
+        images = self.getImages(root)
+        annotations = self.getAnnotations(root, categoryDict)
 
-        self.pLoader.printWhole()
+        coco = {
+            "info": info,
+            "licenses": licenses,
+            "images": images,
+            "annotations": annotations,
+            "categories": categories,
+            "segment_info": []
+        }
+
+        os.mkdir(outputDir)
+        with open(outputDir + "/" + dirName + ".json", "w", encoding="utf-8") as f:
+            json.dump(coco, f, ensure_ascii=False, indent=4)
 
     def getInfo(self, root):
         task = root[1][0]
@@ -351,6 +446,5 @@ class CocoFormat(DataFormat):
 
 
 
-
 if __name__ == '__main__':
-    yolo = YoloFormat(1280)
+    yolo = YoloPolyFormat(640)
