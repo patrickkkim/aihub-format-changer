@@ -260,6 +260,36 @@ class YoloFormat(DataFormat):
 
 
 
+class YoloPolyConverter(YoloFormat):
+    def __init__(self, resize, valid=20, test=5):
+        super().__init__(resize, valid, test)
+
+    def computeShapes(self, f, imageTag, widthDiv, heightDiv):
+        for polygonTag in imageTag.findall("polygon"):
+            attr = polygonTag.attrib
+            label = attr["label"]
+            points = attr["points"].split(";")
+
+            category = self.categoryDict[label]
+            outputLine = str(category)
+            bigX, smallX, bigY, smallY = 0, float("inf"), 0, float("inf")
+            for point in points:
+                x, y = point.split(",")
+                x, y = float(x) / widthDiv, float(y) / heightDiv
+                x, y = x / self.resize, y / self.resize
+                if x > bigX: bigX = x
+                if x < smallX: smallX = x
+                if y > bigY: bigY = y
+                if y < smallY: smallY = y
+                
+            xCenter = ((bigX+smallX) / 2.0)
+            yCenter = ((bigY+smallY) / 2.0)
+            boxWidth = abs(bigX-smallX)
+            boxHeight = abs(bigY-smallY)
+            outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
+            f.write(outputLine + "\n")
+
+
 class YoloPolyFormat(YoloFormat):
     def __init__(self, resize, valid=20, test=5):
         self.polygonMaxCount = 5
@@ -283,9 +313,7 @@ class YoloPolyFormat(YoloFormat):
 
             category = self.categoryDict[label]
             outputLine = str(category)
-            excessCount = self.polygonMaxCount - len(points)
-            excessPoints = [points[-1]] * excessCount
-            for point in (points[:5] + excessPoints):
+            for point in points:
                 x, y = point.split(",")
                 x, y = float(x) / widthDiv, float(y) / heightDiv
                 x, y = x / self.resize, y / self.resize
@@ -459,4 +487,4 @@ class CocoFormat(DataFormat):
 
 
 if __name__ == '__main__':
-    yolo = YoloPolyFormat(640)
+    yolo = YoloPolyConverter(640)
