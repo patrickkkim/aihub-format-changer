@@ -1,16 +1,12 @@
 from PIL import Image
-from tqdm import tqdm
 from random import sample
 
 import xml.etree.cElementTree as ET
-import multiprocessing
 import ray, psutil
 import shutil
 import glob
 import json
 import os, sys
-
-from ProgressBar import ProgressBar
 
 
 
@@ -18,7 +14,7 @@ class ProgressLoader:
     def __init__(self):
         self.progress = 0
         self.length = 1
-        self.blockCount = 30
+        self.blockCount = 20
 
         self.clear()
         self.printWhole("Waiting for process. Please wait a moment.")
@@ -49,6 +45,7 @@ class ProgressLoader:
 
     def clear(self):
         os.system('cls')
+        os.system('clear')
 
 
 class DataFormat:
@@ -74,7 +71,8 @@ class DataFormat:
     @ray.remote
     def resizeImages(self, width, inputDir, outputDir):
         _, fileList = self.getDirList(inputDir)
-        for i, fileName in enumerate(fileList[1:]):
+        for fileName in fileList[1:]:
+            if "xml" in fileName: continue
             self.resizeImage(width, inputDir, outputDir, fileName)
 
     def resizeImage(self, width, inputDir, outputDir, imgName):
@@ -98,6 +96,11 @@ class DataFormat:
             categoryList.append(category)
             categoryDict[label[0].text] = i+1
         return (categoryList, categoryDict)
+
+    def clearDir(self, dirName):
+        shutil.rmtree(dirName)
+        os.mkdir(dirName)
+            
 
     def toIterator(self, objIds):
         while objIds:
@@ -132,6 +135,7 @@ class YoloFormat(DataFormat):
         self.createYolo()        
 
     def createYolo(self):
+        self.clearDir(self.outputPath)
         self.initDir()
         self.initCategory()
         self.createLabels()
@@ -258,8 +262,18 @@ class YoloFormat(DataFormat):
 
 class YoloPolyFormat(YoloFormat):
     def __init__(self, resize, valid=20, test=5):
+        self.polygonMaxCount = 5
         super().__init__(resize, valid, test)
         self.createImgPathFile()
+
+    def countMaxPolygonCount(self, root):
+        imageTags = root.findall("image")
+        for imageTag in imageTags:
+            for polygonTag in imageTag.findall("polygon"): 
+                points = polygonTag.attrib["points"].split(";")
+                count = len(points)
+                if self.polygonMaxCount < count:
+                    self.polygonMaxCount = count
 
     def computeShapes(self, f, imageTag, widthDiv, heightDiv):
         for polygonTag in imageTag.findall("polygon"):
@@ -269,20 +283,13 @@ class YoloPolyFormat(YoloFormat):
 
             category = self.categoryDict[label]
             outputLine = str(category)
-            for point in points:
+            excessCount = self.polygonMaxCount - len(points)
+            excessPoints = [points[-1]] * excessCount
+            for point in (points[:5] + excessPoints):
                 x, y = point.split(",")
-                outputLine += " " + x + " " + y
-
-            # xtl, ytl, xbr, ybr = float(attr['xtl']), float(attr['ytl']), \
-            #     float(attr['xbr']), float(attr['ybr'])
-            # xtl, ytl, xbr, ybr = xtl/widthDiv, ytl/heightDiv, xbr/widthDiv, ybr/heightDiv
-
-            # xCenter = ((xtl+xbr) / 2.0) / self.resize
-            # yCenter = ((ytl+ybr) / 2.0) / self.resize
-            # boxWidth = abs(xtl-xbr) / self.resize
-            # boxHeight = abs(ytl-ybr) / self.resize
-
-            # outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
+                x, y = float(x) / widthDiv, float(y) / heightDiv
+                x, y = x / self.resize, y / self.resize
+                outputLine += " " + "{:.6f}".format(x) + " " + "{:.6f}".format(y)
             f.write(outputLine + "\n")
 
     def initDir(self):
@@ -301,11 +308,15 @@ class YoloPolyFormat(YoloFormat):
             os.mkdir(outputDir + "/valid")
             os.mkdir(outputDir + "/test")
 
+        # for dirName in self.directoryList:
+        #     root = self.getRoot(dirName)
+        #     self.countMaxPolygonCount(root)
+
     def createYaml(self):
         with open(self.outputPath + "data.yaml", "w", encoding="utf-8") as f:
-            f.write("train: ../" + "train.txt" + "\n")
-            f.write("val: ../" + "valid.txt" + "\n")
-            f.write("test: ../" + "test.txt" + "\n\n")
+            f.write("train: ../data/" + "train.txt" + "\n")
+            f.write("val: ../data/" + "valid.txt" + "\n")
+            f.write("test: ../data/" + "test.txt" + "\n\n")
             f.write("nc: " + str(len(self.categoryDict)) + "\n")
             f.write("names: " + "['" + "','".join(self.categoryDict.keys()) + "']")
             f.close()
@@ -315,9 +326,10 @@ class YoloPolyFormat(YoloFormat):
 
         for key, value in sourceDict.items():
             for base, dirs, files in os.walk(self.outputPath + value):
+                files.sort()
                 with open(self.outputPath + key + ".txt", "w") as f:
                     for file in files:
-                        f.write("../" + value + file + "\n")
+                        f.write("../data/" + value + file + "\n")
 
 
 

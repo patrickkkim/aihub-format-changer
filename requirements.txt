@@ -4,6 +4,7 @@ colorama==0.4.4
 Deprecated==1.2.13
 filelock==3.4.2
 grpcio==1.43.0
+importlib-resources==5.4.0
 jsonschema==4.3.3
 msgpack==1.0.3
 numpy==1.22.0
@@ -16,6 +17,5 @@ PyYAML==6.0
 ray==1.9.2
 redis==4.1.0
 six==1.16.0
-tdqm==0.0.1
-tqdm==4.62.3
 wrapt==1.13.3
+zipp==3.7.0
