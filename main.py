@@ -49,16 +49,17 @@ class ProgressLoader:
 
 
 class DataFormat:
-    def __init__(self, resize):
+    def __init__(self, resize, inputPath="./xml/"):
         self.pLoader = ProgressLoader()
         self.resize = resize
-        self.inputPath = "./xml/"
+        self.inputPath = inputPath
         self.directoryList, _ = self.getDirList(self.inputPath)
 
         num_cpus = psutil.cpu_count(logical=False)
-        ray.init(num_cpus=num_cpus, log_to_driver=True)
+        ray.init(num_cpus=num_cpus, log_to_driver=True, ignore_reinit_error=True)
 
-    def getDirList(self, searchDir):
+    @staticmethod
+    def getDirList(searchDir):
         for base, dirs, files in os.walk(searchDir):
             directoryList = []
             fileList = []
@@ -97,11 +98,11 @@ class DataFormat:
             categoryDict[label[0].text] = i+1
         return (categoryList, categoryDict)
 
-    def clearDir(self, dirName):
+    @staticmethod
+    def clearDir(dirName):
         shutil.rmtree(dirName)
         os.mkdir(dirName)
             
-
     def toIterator(self, objIds):
         while objIds:
             done, objIds = ray.wait(objIds)
@@ -120,19 +121,21 @@ class DataFormat:
 
 
 class YoloFormat(DataFormat):
-    def __init__(self, resize, valid=20, test=5):
-        super().__init__(resize)
+    def __init__(self, resize, valid=20, test=5, inputPath="./xml/", outputPath="./yolo/"):
+        super().__init__(resize, inputPath)
+        self.categoryCount = {}
         self.categoryDict = {}
+
         self.valid = valid
         self.test = test
-        self.outputPath = "./yolo/"
+        self.outputPath = outputPath
         self.trainImgPath = ""
         self.trainLabelPath = ""
         self.validImgPath = ""
         self.validLabelPath = ""
         self.testImgPath = ""
         self.testLabelPath = ""
-        self.createYolo()        
+        self.createYolo()
 
     def createYolo(self):
         self.clearDir(self.outputPath)
@@ -142,6 +145,7 @@ class YoloFormat(DataFormat):
         self.createYaml()
         self.resizeImages()
         self.shuffleData(self.outputPath + self.trainImgPath)
+        # self.countCategories()
 
     def initDir(self):
         self.trainImgPath = "train/images/"
@@ -162,10 +166,11 @@ class YoloFormat(DataFormat):
         for dirName in self.directoryList:
             root = self.getRoot(dirName)
             _, subDict = self.getCategories(root)
-            for key, value in subDict.items():
+            for key, _ in subDict.items():
                 self.categoryDict[key] = None
         for i, pair in enumerate(self.categoryDict.items()):
             self.categoryDict[pair[0]] = i
+            self.categoryCount[pair[0]] = 0
         
     def createLabels(self):
         tasksPreLaunch = []
@@ -245,6 +250,7 @@ class YoloFormat(DataFormat):
         for boxTag in imageTag.findall("box"):
             attr = boxTag.attrib
             label = attr["label"]
+
             xtl, ytl, xbr, ybr = float(attr['xtl']), float(attr['ytl']), \
                 float(attr['xbr']), float(attr['ybr'])
             xtl, ytl, xbr, ybr = xtl/widthDiv, ytl/heightDiv, xbr/widthDiv, ybr/heightDiv
@@ -258,11 +264,25 @@ class YoloFormat(DataFormat):
             outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
             f.write(outputLine + "\n")
 
+    def countCategories(self):
+        for dirName in self.directoryList:
+            root = self.getRoot(dirName)
+            imageTags = root.findall("image")
+            for imageTag in imageTags:
+                name = imageTag.attrib['name'][:-4]
+                with open(self.outputPath + self.trainLabelPath + name + ".txt", "w") as f:
+                    for boxTag in imageTag.findall("box"):
+                        attr = boxTag.attrib
+                        label = attr["label"]
+                        self.categoryCount[label] += 1
+        print(self.categoryCount)
+
 
 
 class YoloPolyConverter(YoloFormat):
-    def __init__(self, resize, valid=20, test=5):
-        super().__init__(resize, valid, test)
+    def __init__(self, resize, valid=20, test=5, prevCatCount=0, inputPath="./xml/", outputPath="./yolo/"):
+        self.prevCatCount = prevCatCount
+        super().__init__(resize, valid, test, inputPath, outputPath)
 
     def computeShapes(self, f, imageTag, widthDiv, heightDiv):
         for polygonTag in imageTag.findall("polygon"):
@@ -288,6 +308,112 @@ class YoloPolyConverter(YoloFormat):
             boxHeight = abs(bigY-smallY)
             outputLine = "{} {} {} {} {}".format(category, xCenter, yCenter, boxWidth, boxHeight)
             f.write(outputLine + "\n")
+
+    def initCategory(self):
+        for dirName in self.directoryList:
+            root = self.getRoot(dirName)
+            _, subDict = self.getCategories(root)
+            for key, _ in subDict.items():
+                self.categoryDict[key] = None
+        for i, pair in enumerate(self.categoryDict.items()):
+            self.categoryDict[pair[0]] = i + self.prevCatCount
+            self.categoryCount[pair[0]] = 0
+
+
+
+class YoloPolyCombiner:
+    def __init__(self, resize, valid=20, test=5):
+        self.yoloInput = "./images/object/"
+        self.polyInput = "./images/road/"
+        self.outputPath = "./results/"
+        self.yoloOutput = self.outputPath + "yolo/"
+        self.polyOutput = self.outputPath + "poly/"
+        self.combinedOutput = self.outputPath + "combined/"
+        self.categoryDict = {}
+        self.yolonc = 0
+        self.polync = 0
+
+        self.initDir()
+        yolo = YoloFormat(resize, valid, test, self.yoloInput, self.yoloOutput)
+        poly = YoloPolyConverter(resize, valid, test, 0, self.polyInput, self.polyOutput)
+        self.initCategories()
+        self.createYaml()
+        self.migrateFiles()
+
+    def initCategories(self):
+        self.readCategory(self.yolonc, self.yoloOutput + "data.yaml")
+        self.yolonc = len(self.categoryDict)
+        self.readCategory(self.yolonc, self.polyOutput + "data.yaml")
+        self.polync = len(self.categoryDict) - self.yolonc
+
+    def readCategory(self, nc, fileName):
+        with open(fileName, "r") as f:
+            for i, line in enumerate(f):
+                if i == 5:
+                    line = line[line.find("[")+1:-1]
+                    categoryList = line.replace("'", "").split(",")
+                    for j, category in enumerate(categoryList):
+                        self.categoryDict[category] = nc + j
+            f.close()
+
+    def createYaml(self):
+        nc = len(self.categoryDict)
+        categoryList = list(self.categoryDict.keys())
+        outputPath = "./results/combined/"
+        with open(outputPath + "data.yaml", "w", encoding="utf-8") as f:
+            f.write("train: ../train/images/" + "\n")
+            f.write("val: ../valid/images/" + "\n")
+            f.write("test: ../test/images/" + "\n\n")
+            f.write("nc: " + str(nc) + "\n")
+            f.write("names: " + str(categoryList))
+            f.close()
+
+    def initDir(self):
+        DataFormat.clearDir(self.outputPath)
+        os.mkdir(self.yoloOutput)
+        os.mkdir(self.polyOutput)
+        os.mkdir(self.combinedOutput)
+
+        outputList = ["train", "valid", "test"]
+        for dirName in outputList:
+            outputDir = self.combinedOutput + dirName
+            os.mkdir(outputDir)
+            os.mkdir(outputDir + "/images")
+            os.mkdir(outputDir + "/labels")
+
+    def moveLabels(self, searchDir, outputDir, increment=0):
+        _, fileList = DataFormat.getDirList(searchDir)
+        for labelFile in fileList:
+            fin = open(searchDir + labelFile, "r", encoding="utf-8")
+            fout = open(outputDir + labelFile, "w", encoding="utf-8")
+            for line in fin:
+                dataList = line.split(" ")
+                newCatNum = int(dataList[0]) + increment
+                dataList[0] = str(newCatNum)
+                output = " "
+                fout.write(output.join(dataList))
+            fin.close()
+            fout.close()
+
+    def moveImages(self, searchDir, outputDir):
+        _, fileList = DataFormat.getDirList(searchDir)
+        for imageFile in fileList:
+            shutil.move(searchDir+imageFile, outputDir+imageFile)
+
+    def migrateFiles(self):
+        DirList = ["train/", "valid/", "test/"]
+        for inputDir in DirList:
+            labelDir = inputDir + "labels/"
+            imageDir = inputDir + "images/"
+
+            outputDir = self.combinedOutput + labelDir
+            self.moveLabels(self.yoloOutput+labelDir, outputDir)
+            self.moveLabels(self.polyOutput+labelDir, outputDir, self.yolonc)
+
+            outputDir = self.combinedOutput + imageDir
+            self.moveImages(self.yoloOutput+imageDir, outputDir)
+            self.moveImages(self.polyOutput+imageDir, outputDir)
+
 
 
 class YoloPolyFormat(YoloFormat):
@@ -487,4 +613,6 @@ class CocoFormat(DataFormat):
 
 
 if __name__ == '__main__':
-    yolo = YoloPolyConverter(640)
+    #yolo = YoloFormat(640)
+    #yolo = YoloPolyConverter(640, prevCatCount=15)
+    YoloPolyCombiner(640, 20, 2)
